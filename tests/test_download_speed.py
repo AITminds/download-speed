@@ -2,8 +2,10 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
+from tempfile import TemporaryDirectory
 import threading
 import time
 import unittest
@@ -28,7 +30,9 @@ class Handler(BaseHTTPRequestHandler):
             self.server.events.append("start")
             self.server.request_headers.append(dict(self.headers))
 
-        if self.path == "/missing":
+        if self.path == "/missing" or (
+            self.path == "/fail-after-two" and len(self.server.paths) > 2
+        ):
             self.send_error(404, "File not found")
             return
         if self.path == "/redirect":
@@ -97,12 +101,27 @@ def invoke_main(arguments):
     return status, output.getvalue(), errors.getvalue()
 
 
-class DownloadTests(unittest.TestCase):
+class IsolatedDownloadsTests(unittest.TestCase):
+    def setUp(self):
+        temporary_directory = TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.project_root = Path(temporary_directory.name) / "project"
+        self.project_root.mkdir()
+        self.downloads_dir = self.project_root / "downloads"
+        directory_patch = patch("download_speed.DOWNLOADS_DIR", self.downloads_dir)
+        directory_patch.start()
+        self.addCleanup(directory_patch.stop)
+
+
+class DownloadTests(IsolatedDownloadsTests):
     def test_cli_downloads_ten_complete_responses_sequentially(self):
+        script = self.project_root / "download_speed.py"
+        shutil.copyfile(PROJECT_ROOT / "download_speed.py", script)
         with local_server() as (server, base_url):
             result = subprocess.run(
-                [sys.executable, "download_speed.py", f"{base_url}/payload"],
-                cwd=PROJECT_ROOT,
+                [sys.executable, str(script), f"{base_url}/payload"],
+                # The output directory must follow the script, not the working directory.
+                cwd=self.project_root.parent,
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -114,6 +133,13 @@ class DownloadTests(unittest.TestCase):
             self.assertIn(f"Total downloaded: {len(PAYLOAD) * 10} bytes", result.stdout)
             self.assertIn("Requests: 10", result.stdout)
             self.assertIn("Download speed:", result.stdout)
+            self.assertIn(f"Downloads directory: {self.downloads_dir}", result.stdout)
+            saved_files = sorted(self.downloads_dir.iterdir())
+            self.assertEqual(len(saved_files), 10)
+            for number, saved_file in enumerate(saved_files, 1):
+                self.assertTrue(saved_file.name.endswith(f"-{number:02d}-payload.bin"))
+                self.assertEqual(saved_file.read_bytes(), PAYLOAD)
+            self.assertFalse((self.project_root.parent / "downloads").exists())
             timings = [
                 float(line.split(" in ")[1].split()[0])
                 for line in result.stdout.splitlines()
@@ -125,17 +151,23 @@ class DownloadTests(unittest.TestCase):
                 self.assertEqual(headers["Accept-Encoding"], "identity")
 
     def test_counts_actual_bytes_for_chunked_and_unframed_bodies(self):
+        self.downloads_dir.mkdir()
         for path in ("/chunked", "/no-length"):
             with self.subTest(path=path), local_server() as (_, base_url):
-                downloaded, elapsed = download_speed.download(base_url + path, 2)
+                destination = self.downloads_dir / f"{path[1:]}.bin"
+                downloaded, elapsed = download_speed.download(base_url + path, 2, destination)
                 self.assertEqual(downloaded, len(PAYLOAD))
                 self.assertGreater(elapsed, 0)
+                self.assertEqual(destination.read_bytes(), PAYLOAD)
 
     def test_follows_redirect_and_reads_final_body(self):
+        self.downloads_dir.mkdir()
+        destination = self.downloads_dir / "redirect.bin"
         with local_server() as (server, base_url):
-            downloaded, _ = download_speed.download(f"{base_url}/redirect", 2)
+            downloaded, _ = download_speed.download(f"{base_url}/redirect", 2, destination)
             self.assertEqual(downloaded, len(PAYLOAD))
             self.assertEqual(server.paths, ["/redirect", "/payload"])
+            self.assertEqual(destination.read_bytes(), PAYLOAD)
 
     def test_stops_on_http_error_without_printing_summary(self):
         with local_server() as (server, base_url):
@@ -145,6 +177,7 @@ class DownloadTests(unittest.TestCase):
             self.assertIn("request 1/10", errors)
             self.assertNotIn("Download speed:", output)
             self.assertEqual(server.paths, ["/missing"])
+            self.assertEqual(list(self.downloads_dir.iterdir()), [])
 
     def test_rejects_truncated_and_unfinished_chunked_bodies(self):
         for path in ("/truncated", "/broken-chunked"):
@@ -154,6 +187,7 @@ class DownloadTests(unittest.TestCase):
                 self.assertIn("request 1/10", errors)
                 self.assertNotIn("Download speed:", output)
                 self.assertEqual(server.paths, [path])
+                self.assertEqual(list(self.downloads_dir.iterdir()), [])
 
     def test_timeout_applies_while_reading_body(self):
         with local_server() as (server, base_url):
@@ -164,9 +198,36 @@ class DownloadTests(unittest.TestCase):
             self.assertIn("timed out", errors.lower())
             self.assertNotIn("Download speed:", output)
             self.assertEqual(server.paths, ["/timeout"])
+            self.assertEqual(list(self.downloads_dir.iterdir()), [])
+
+    def test_rerun_preserves_previous_files_and_original_extension(self):
+        with local_server() as (_, base_url):
+            arguments = [f"{base_url}/image.jpg"]
+            self.assertEqual(invoke_main(arguments)[0], 0)
+            previous_files = set(self.downloads_dir.iterdir())
+            self.assertEqual(len(previous_files), 10)
+            self.assertEqual(invoke_main(arguments)[0], 0)
+        all_files = set(self.downloads_dir.iterdir())
+        self.assertEqual(len(all_files), 20)
+        self.assertTrue(previous_files.issubset(all_files))
+        for saved_file in all_files:
+            self.assertTrue(saved_file.name.endswith("-image.jpg"))
+            self.assertEqual(saved_file.read_bytes(), PAYLOAD)
+
+    def test_error_keeps_completed_files_without_reporting_partial_result(self):
+        with local_server() as (server, base_url):
+            status, output, errors = invoke_main([f"{base_url}/fail-after-two"])
+            self.assertEqual(server.paths, ["/fail-after-two"] * 3)
+        self.assertEqual(status, 1)
+        self.assertIn("request 3/10", errors)
+        self.assertNotIn("Download speed:", output)
+        saved_files = list(self.downloads_dir.iterdir())
+        self.assertEqual(len(saved_files), 2)
+        for saved_file in saved_files:
+            self.assertEqual(saved_file.read_bytes(), PAYLOAD)
 
 
-class CalculationAndArgumentTests(unittest.TestCase):
+class CalculationAndArgumentTests(IsolatedDownloadsTests):
     def test_speed_uses_total_bytes_divided_by_total_duration(self):
         measurements = [(1_000_000, 1.0)] + [(3_000_000, 2.0)] * 9
         with patch("download_speed.download", side_effect=measurements) as download:
@@ -178,15 +239,6 @@ class CalculationAndArgumentTests(unittest.TestCase):
         self.assertIn("Total downloaded: 28000000 bytes (28.000 MB)", output)
         self.assertIn("Total request time: 19.000 s", output)
         self.assertIn("Download speed: 1.474 MB/s", output)
-
-    def test_error_after_successful_requests_does_not_report_partial_result(self):
-        measurements = [(1000, 1.0), (2000, 2.0), OSError("Connection lost")]
-        with patch("download_speed.download", side_effect=measurements) as download:
-            status, output, errors = invoke_main(["https://example.com/file"])
-        self.assertEqual(status, 1)
-        self.assertEqual(download.call_count, 3)
-        self.assertIn("request 3/10", errors)
-        self.assertNotIn("Download speed:", output)
 
     def test_rejects_invalid_arguments_before_network_access(self):
         invalid_arguments = [
@@ -211,6 +263,7 @@ class CalculationAndArgumentTests(unittest.TestCase):
                     invoke_main(arguments)
                 self.assertEqual(error.exception.code, 2)
             download.assert_not_called()
+        self.assertFalse(self.downloads_dir.exists())
 
     def test_custom_timeout_is_used_for_every_request(self):
         with patch("download_speed.download", return_value=(10, 0.1)) as download:
@@ -218,14 +271,38 @@ class CalculationAndArgumentTests(unittest.TestCase):
         self.assertEqual(status, 0)
         self.assertEqual(download.call_count, 10)
         for call in download.call_args_list:
-            self.assertEqual(call.args, ("https://example.com/file", 2.5))
+            self.assertEqual(call.args[:2], ("https://example.com/file", 2.5))
+            self.assertEqual(call.args[2].parent, self.downloads_dir)
 
-    def test_interruption_returns_130_without_summary(self):
-        with patch("download_speed.download", side_effect=KeyboardInterrupt):
+    def test_interruption_removes_partial_file_and_returns_130(self):
+        with patch("download_speed.urlopen") as open_url:
+            response = open_url.return_value.__enter__.return_value
+            response.status = 200
+            response.read.side_effect = [b"partial body", KeyboardInterrupt]
             status, output, errors = invoke_main(["https://example.com/file"])
         self.assertEqual(status, 130)
         self.assertIn("interrupted", errors)
         self.assertNotIn("Download speed:", output)
+        self.assertEqual(list(self.downloads_dir.iterdir()), [])
+
+    def test_existing_destination_is_not_overwritten_or_deleted(self):
+        destination = self.project_root / "existing.bin"
+        destination.write_bytes(b"previous download")
+        with patch("download_speed.urlopen") as open_url:
+            with self.assertRaises(FileExistsError):
+                download_speed.download("https://example.com/file", 2, destination)
+            open_url.assert_not_called()
+        self.assertEqual(destination.read_bytes(), b"previous download")
+
+    def test_directory_creation_error_is_reported_before_downloading(self):
+        self.downloads_dir.write_text("existing file", encoding="utf-8")
+        with patch("download_speed.download") as download:
+            status, output, errors = invoke_main(["https://example.com/file"])
+            download.assert_not_called()
+        self.assertEqual(status, 1)
+        self.assertIn("Cannot create downloads directory", errors)
+        self.assertNotIn("Download speed:", output)
+        self.assertEqual(self.downloads_dir.read_text(encoding="utf-8"), "existing file")
 
 
 if __name__ == "__main__":
